@@ -1,54 +1,82 @@
+# api/index.py (improved logging & runtime checks)
+import os
+import sys
+import traceback
+import json
+import io
+import base64
+from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify
+
+# CORS
 try:
     from flask_cors import CORS
 except Exception:
     CORS = None
-import os
-import io
-import base64
-from typing import Any, Dict, List, Optional, Tuple
 
-# Optional: Pillow for basic image probing
+# Pillow
 try:
     from PIL import Image, ExifTags
-except Exception:  # Pillow may not be installed yet in dev
+except Exception:
     Image = None
     ExifTags = None
 
+# requests
 try:
     import requests
 except Exception:
     requests = None
 
+# google generative ai library
 try:
     import google.generativeai as genai
 except Exception:
     genai = None
 
-# New modular helpers
+# modular helpers (ai / vision)
 try:
     from .ai import call_gemini_ensemble
-except Exception:
+except Exception as e:
     call_gemini_ensemble = None
+    print("AI helper import failed:", e, file=sys.stderr)
+
 try:
     from .vision import align_and_normalize
-except Exception:
+except Exception as e:
     align_and_normalize = None
+    print("Vision helper import failed:", e, file=sys.stderr)
 
-# Optional: OpenCV for classical vision fallback
+# opencv / numpy may be heavy -> check
 try:
     import cv2  # type: ignore
-except Exception:
+except Exception as e:
     cv2 = None
+    print("cv2 import failed:", str(e), file=sys.stderr)
+
 try:
     import numpy as np  # type: ignore
-except Exception:
+except Exception as e:
     np = None
+    print("numpy import failed:", str(e), file=sys.stderr)
 
 app = Flask(__name__)
 if CORS is not None:
-    # Allow cross-origin requests for the analyzer endpoint during development
     CORS(app, resources={r"/analyze": {"origins": "*"}})
+
+def _configure_genai():
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("No GOOGLE_API_KEY/GEMINI_API_KEY set in environment", file=sys.stderr)
+        return False
+    if genai is None:
+        print("google.generativeai not installed or failed to import", file=sys.stderr)
+        return False
+    try:
+        genai.configure(api_key=api_key)
+        return True
+    except Exception as e:
+        print("genai.configure error:", str(e), file=sys.stderr)
+        return False
 
 @app.route('/')
 def home():
@@ -314,16 +342,24 @@ def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, An
         return []
 
 
-@app.route('/analyze', methods=['POST'])
+@app.route("/analyze", methods=["POST"])
 def analyze():
-    """POST JSON: { baseline_url|baseline_b64, current_url|current_b64 }
-
-    Returns single JSON object following the requested schema.
-    """
     try:
+        # quick runtime sanity
+        if not _configure_genai():
+            # If you do not want to require gemini for fallback, change logic here.
+            # For debugging, return an explicit error.
+            return jsonify({
+                "error": "GOOGLE_API_KEY / GEMINI_API_KEY not configured or google.generativeai import failed.",
+                "differences": [],
+                "aggregate_tis": 100,
+                "overall_assessment": "UNKNOWN"
+            }), 500
+
         data = request.get_json(silent=True) or {}
-        baseline_src = data.get('baseline_url') or data.get('baseline_b64')
-        current_src = data.get('current_url') or data.get('current_b64')
+        baseline_src = data.get("baseline_url") or data.get("baseline_b64")
+        current_src = data.get("current_url") or data.get("current_b64")
+
         baseline_bytes, baseline_mime = _load_image_bytes(baseline_src)
         current_bytes, current_mime = _load_image_bytes(current_src)
 
@@ -332,23 +368,20 @@ def analyze():
 
         differences = _call_gemini((baseline_bytes, baseline_mime), (current_bytes, current_mime))
 
-        # Classical CV fallback for richer localized differences
+        # fallback to classical CV if gemini empty or low confidence
         if (not differences or sum(d.get("confidence", 0) for d in differences) / max(1, len(differences)) < 0.6) and baseline_bytes and current_bytes:
-            cv_regions: List[Dict[str, Any]] = []
+            cv_regions = []
             try:
                 if align_and_normalize is not None and cv2 is not None:
-                    aligned_b, aligned_c = align_and_normalize(baseline_bytes, current_bytes)
-                    if aligned_b is not None and aligned_c is not None:
-                        cv_regions = _classical_diff_regions(
-                            cv2.imencode('.jpg', aligned_b)[1].tobytes(),
-                            cv2.imencode('.jpg', aligned_c)[1].tobytes(),
-                        )
+                    ab, ac = align_and_normalize(baseline_bytes, current_bytes)
+                    if ab is not None and ac is not None:
+                        cv_regions = _classical_diff_regions(cv2.imencode('.jpg', ab)[1].tobytes(), cv2.imencode('.jpg', ac)[1].tobytes())
                 if not cv_regions:
                     cv_regions = _classical_diff_regions(baseline_bytes, current_bytes)
-            except Exception:
+            except Exception as e:
+                print("classical diff error:", str(e), file=sys.stderr)
                 cv_regions = _classical_diff_regions(baseline_bytes, current_bytes)
             if cv_regions:
-                # If Gemini returned something, merge distinct regions by ID
                 if differences:
                     seen = {d.get("id") for d in differences}
                     for r in cv_regions:
@@ -356,32 +389,29 @@ def analyze():
                             differences.append(r)
                 else:
                     differences = cv_regions
-        tis, assessment = _compute_overall(differences)
 
-        # Heuristic confidence overall
+        tis, assessment = _compute_overall(differences)
         conf_overall = 0.9 if differences else 0.7
 
-        response: Dict[str, Any] = {
+        response = {
             "differences": differences,
             "baseline_image_info": baseline_info,
             "current_image_info": current_info,
             "aggregate_tis": tis,
             "overall_assessment": assessment,
             "confidence_overall": conf_overall,
-            "notes": (
-                "No significant issues detected." if not differences else
-                "Detected potential integrity issues; follow suggested actions."
-            ),
+            "notes": "OK" if not differences else "Potential issues detected"
         }
         return jsonify(response)
     except Exception as e:
+        tb = traceback.format_exc()
+        print("Exception in /analyze:", tb, file=sys.stderr)
+        # return error info (status 500) so client sees problem
         return jsonify({
+            "error": "Analyzer internal error",
+            "details": str(e),
+            "traceback": tb,
             "differences": [],
-            "baseline_image_info": {"resolution": None, "exif_present": False, "camera_make": None, "camera_model": None, "datetime": None},
-            "current_image_info": {"resolution": None, "exif_present": False, "camera_make": None, "camera_model": None, "datetime": None},
             "aggregate_tis": 100,
-            "overall_assessment": "OK",
-            "confidence_overall": 0.5,
-            "notes": "Analyzer error; defaulting to OK.",
-            "error": str(e),
-        }), 200
+            "overall_assessment": "UNKNOWN"
+        }), 500
