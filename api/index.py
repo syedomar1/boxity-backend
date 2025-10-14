@@ -25,6 +25,16 @@ try:
 except Exception:
     genai = None
 
+# New modular helpers
+try:
+    from .ai import call_gemini_ensemble
+except Exception:
+    call_gemini_ensemble = None
+try:
+    from .vision import align_and_normalize
+except Exception:
+    align_and_normalize = None
+
 # Optional: OpenCV for classical vision fallback
 try:
     import cv2  # type: ignore
@@ -141,59 +151,11 @@ def _compute_overall(differences: List[Dict[str, Any]]) -> Tuple[int, str]:
 
 
 def _call_gemini(baseline: Tuple[Optional[bytes], Optional[str]], current: Tuple[Optional[bytes], Optional[str]]) -> List[Dict[str, Any]]:
-    """Calls Gemini to detect differences and return normalized items.
-
-    Falls back to empty if API/key not configured. The prompt instructs the model to
-    return only the differences array in the specified schema.
-    """
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    baseline_bytes, baseline_mime = baseline
-    current_bytes, current_mime = current
-    if genai is None or not api_key or not baseline_bytes or not current_bytes:
+    if call_gemini_ensemble is None:
         return []
     try:
-        genai.configure(api_key=api_key)
-        generation_config = {"temperature": 0.2, "response_mime_type": "application/json"}
-        model = genai.GenerativeModel("gemini-1.5-pro-latest", generation_config=generation_config)
-        system_prompt = (
-            "You are a multimodal forensic/computer-vision assistant specialized in package integrity analysis.\n"
-            "Task: Compare the baseline vs current package photos and detect concrete issues (e.g., dents, scratches, seal tamper, label mismatch, repackaging, stains, color shifts, missing_item, digital_edit).\n"
-            "Rules:\n"
-            "- Return STRICT JSON: {\"differences\":[...]} with NO prose.\n"
-            "- For each difference, include: id, region (human label), bbox [x,y,w,h] normalized 0..1 (omit or null if unsure), type (one of [dent, scratch, seal_tamper, label_mismatch, color_shift, repackaging, stain, missing_item, digital_edit, other]), description (<=2 sentences), severity [LOW,MEDIUM,HIGH,CRITICAL], confidence 0.0-1.0, explainability (1-3 short evidences), suggested_action, tis_delta (integer; follow weight guidance).\n"
-            "- Prefer multiple localized regions with bboxes rather than one global note.\n"
-            "- Identify open vs closed box state, seal integrity, and label/logo/QR differences.\n"
-            "- Only report digital_edit if you see artifacts (resampling grids, copy-move, inconsistent noise, double-JPEG) and mention indicators in explainability.\n"
-        )
-        baseline_part = {"mime_type": baseline_mime or "image/jpeg", "data": baseline_bytes}
-        current_part = {"mime_type": current_mime or "image/jpeg", "data": current_bytes}
-
-        prompt = (
-            "Weighting/TIS: dent (-8..-18), scratch (-3..-7), seal_tamper (-25..-45), label_mismatch (-20..-40), digital_edit (-30..-60), missing_item (-100). "
-            "Ensure bboxes are normalized. If unsure, set bbox to null and reduce confidence."
-        )
-        result = model.generate_content([
-            system_prompt,
-            prompt,
-            "Baseline image:", baseline_part,
-            "Current image:", current_part,
-        ])
-        text = (result.text or "").strip()
-        # Robust JSON extraction
-        import json, re
-        if not text:
-            return []
-        # Remove code fences if present
-        if text.startswith("```"):
-            text = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text)
-        # If still not a JSON object, try to locate the first {...}
-        if not text.lstrip().startswith('{'):
-            match = re.search(r"\{[\s\S]*\}", text)
-            text = match.group(0) if match else '{"differences": []}'
-        payload = json.loads(text)
-        items = payload.get("differences", [])
-        normalized = [_normalize_diff_item(it) for it in items if isinstance(it, dict)]
-        return normalized
+        items = call_gemini_ensemble(baseline, current)
+        return [_normalize_diff_item(it) for it in items if isinstance(it, dict)]
     except Exception:
         return []
 
@@ -372,7 +334,19 @@ def analyze():
 
         # Classical CV fallback for richer localized differences
         if (not differences or sum(d.get("confidence", 0) for d in differences) / max(1, len(differences)) < 0.6) and baseline_bytes and current_bytes:
-            cv_regions = _classical_diff_regions(baseline_bytes, current_bytes)
+            cv_regions: List[Dict[str, Any]] = []
+            try:
+                if align_and_normalize is not None and cv2 is not None:
+                    aligned_b, aligned_c = align_and_normalize(baseline_bytes, current_bytes)
+                    if aligned_b is not None and aligned_c is not None:
+                        cv_regions = _classical_diff_regions(
+                            cv2.imencode('.jpg', aligned_b)[1].tobytes(),
+                            cv2.imencode('.jpg', aligned_c)[1].tobytes(),
+                        )
+                if not cv_regions:
+                    cv_regions = _classical_diff_regions(baseline_bytes, current_bytes)
+            except Exception:
+                cv_regions = _classical_diff_regions(baseline_bytes, current_bytes)
             if cv_regions:
                 # If Gemini returned something, merge distinct regions by ID
                 if differences:
