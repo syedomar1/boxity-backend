@@ -165,7 +165,7 @@ def _clamp(value: int, lo: int, hi: int) -> int:
 
 
 def _compute_overall(differences: List[Dict[str, Any]]) -> Tuple[int, str, float, str]:
-    """Enhanced TIS calculation with confidence scoring and detailed assessment.
+    """Enhanced TIS calculation with proper difference weighting.
     
     Returns: (tis_score, assessment, confidence, notes)
     """
@@ -177,11 +177,14 @@ def _compute_overall(differences: List[Dict[str, Any]]) -> Tuple[int, str, float
     total_confidence = 0.0
     severity_weights = {"HIGH": 1.0, "MEDIUM": 0.6, "LOW": 0.3}
     critical_issues = []
+    high_severity_count = 0
+    medium_severity_count = 0
     
     for d in differences:
         try:
-            # Apply TIS delta
-            tis += int(d.get("tis_delta", 0))
+            # Apply TIS delta - this should reduce the score
+            tis_delta = int(d.get("tis_delta", 0))
+            tis += tis_delta  # tis_delta is negative, so this reduces the score
             
             # Weight confidence by severity
             severity = str(d.get("severity", "LOW")).upper()
@@ -189,8 +192,14 @@ def _compute_overall(differences: List[Dict[str, Any]]) -> Tuple[int, str, float
             confidence = float(d.get("confidence", 0.5))
             total_confidence += confidence * weight
             
+            # Count severities
+            if severity == "HIGH":
+                high_severity_count += 1
+            elif severity == "MEDIUM":
+                medium_severity_count += 1
+            
             # Track critical issues
-            if severity == "HIGH" and confidence > 0.7:
+            if severity == "HIGH" and confidence > 0.6:
                 issue_type = str(d.get("type", "unknown"))
                 if issue_type in ["seal_tamper", "repackaging", "digital_edit"]:
                     critical_issues.append(issue_type)
@@ -201,10 +210,10 @@ def _compute_overall(differences: List[Dict[str, Any]]) -> Tuple[int, str, float
     # Calculate weighted confidence
     avg_confidence = total_confidence / max(1, len(differences)) if differences else 0.0
     
-    # Clamp TIS score
+    # Clamp TIS score to ensure it's never above 100
     tis = _clamp(tis, 0, 100)
     
-    # Enhanced assessment logic
+    # Enhanced assessment logic based on actual TIS score
     if tis >= 80:
         assessment = "SAFE"
         notes = "Product integrity maintained - safe to proceed"
@@ -215,16 +224,30 @@ def _compute_overall(differences: List[Dict[str, Any]]) -> Tuple[int, str, float
         assessment = "HIGH_RISK"
         notes = "High risk detected - immediate quarantine required"
     
-    # Override for critical issues
+    # Additional overrides for critical security issues
     if critical_issues:
-        if "seal_tamper" in critical_issues or "repackaging" in critical_issues:
-            tis = min(tis, 25)  # Force high risk for tampering
+        if "seal_tamper" in critical_issues:
+            tis = min(tis, 20)  # Force very high risk for seal tampering
             assessment = "HIGH_RISK"
             notes = f"Critical security breach detected: {', '.join(critical_issues)} - immediate quarantine required"
+        elif "repackaging" in critical_issues:
+            tis = min(tis, 15)  # Force highest risk for repackaging
+            assessment = "HIGH_RISK"
+            notes = f"Product substitution detected: {', '.join(critical_issues)} - immediate quarantine required"
         elif "digital_edit" in critical_issues:
-            tis = min(tis, 15)  # Force highest risk for digital tampering
+            tis = min(tis, 10)  # Force highest risk for digital tampering
             assessment = "HIGH_RISK"
             notes = "Digital tampering detected - highest security risk"
+    
+    # Additional logic for multiple high-severity issues
+    if high_severity_count >= 2:
+        tis = min(tis, 30)
+        assessment = "HIGH_RISK"
+        notes = f"Multiple high-severity issues detected ({high_severity_count} issues) - immediate quarantine required"
+    elif high_severity_count >= 1 and medium_severity_count >= 2:
+        tis = min(tis, 35)
+        assessment = "HIGH_RISK"
+        notes = f"Multiple damage issues detected - immediate quarantine required"
     
     return tis, assessment, avg_confidence, notes
 
@@ -375,10 +398,10 @@ def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, An
                 "type": "repackaging",
                 "description": "Current image appears to be a completely different object or heavily repackaged item compared to baseline.",
                 "severity": "HIGH",
-                "confidence": 0.90,
-                "explainability": [f"extremely low ORB similarity: {sim:.2f}", "structural mismatch"],
+                "confidence": 0.95,
+                "explainability": [f"extremely low ORB similarity: {sim:.2f}", "structural mismatch", "different object detected"],
                 "suggested_action": "Immediate quarantine - potential product substitution",
-                "tis_delta": -50,
+                "tis_delta": -60,  # Higher penalty for completely different objects
             }))
         elif sim < 0.4:
             regions.append(_normalize_diff_item({
@@ -387,11 +410,11 @@ def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, An
                 "bbox": None,
                 "type": "repackaging",
                 "description": "Significant structural changes detected - possible repackaging or major damage.",
-                "severity": "MEDIUM",
-                "confidence": 0.75,
+                "severity": "HIGH",
+                "confidence": 0.80,
                 "explainability": [f"low ORB similarity: {sim:.2f}", "structural changes"],
-                "suggested_action": "Supervisor review required",
-                "tis_delta": -25,
+                "suggested_action": "Immediate quarantine - major structural changes",
+                "tis_delta": -35,
             }))
 
         # Enhanced contour analysis with better heuristics
@@ -406,28 +429,45 @@ def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, An
             perimeter = cv2.arcLength(cnt, True)
             circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
             
-            # Region classification
+            # Enhanced region classification for better specificity
             near_top = y < top_band
             in_center = (center_region[0] <= x <= center_region[2] and 
                         center_region[1] <= y <= center_region[3])
             near_edge = (x < w1 * 0.1 or x + w > w1 * 0.9 or 
                         y < h1 * 0.1 or y + h > h1 * 0.9)
             
-            region_label = ("top seal area" if near_top else 
-                          "center region" if in_center else 
-                          "edge region" if near_edge else "side region")
+            # More specific region labeling
+            if near_top:
+                if x < w1 * 0.33:
+                    region_label = "top-left corner"
+                elif x + w > w1 * 0.66:
+                    region_label = "top-right corner"
+                else:
+                    region_label = "top edge"
+            elif x < w1 * 0.2:
+                region_label = "left side"
+            elif x + w > w1 * 0.8:
+                region_label = "right side"
+            elif y < h1 * 0.2:
+                region_label = "top edge"
+            elif y + h > h1 * 0.8:
+                region_label = "bottom edge"
+            elif in_center:
+                region_label = "center"
+            else:
+                region_label = "side region"
             
             bbox = [x / w1, y / h1, w / w1, h / h1]
             
-            # Enhanced damage type classification
+            # Enhanced damage type classification with better region specificity
             if near_top and h > 0.06 * h1 and w > 0.2 * w1:
                 # Seal tampering detection
                 diff_item = {
                     "id": f"seal-tamper-{i}",
-                    "region": "seal area",
+                    "region": region_label,
                     "bbox": bbox,
                     "type": "seal_tamper",
-                    "description": f"Seal area shows significant change - potential tampering detected (area: {area/img_area*100:.1f}% of image).",
+                    "description": f"Seal area shows significant change - potential tampering detected in {region_label} (area: {area/img_area*100:.1f}% of image).",
                     "severity": "HIGH",
                     "confidence": 0.85,
                     "explainability": ["large change in seal area", "top region modification", f"area coverage: {area/img_area*100:.1f}%"],
@@ -441,7 +481,7 @@ def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, An
                     "region": region_label,
                     "bbox": bbox,
                     "type": "scratch",
-                    "description": f"Linear mark detected - consistent with scratch or cut (length: {max(w,h):.0f}px).",
+                    "description": f"Linear scratch mark detected on {region_label} (length: {max(w,h):.0f}px).",
                     "severity": "LOW",
                     "confidence": 0.75,
                     "explainability": ["high aspect ratio", "linear pattern", "edge contrast"],
@@ -455,7 +495,7 @@ def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, An
                     "region": region_label,
                     "bbox": bbox,
                     "type": "dent",
-                    "description": f"Circular deformation detected - likely impact damage (diameter: {max(w,h):.0f}px).",
+                    "description": f"Circular dent detected on {region_label} - likely impact damage (diameter: {max(w,h):.0f}px).",
                     "severity": "MEDIUM" if area / img_area < 0.05 else "HIGH",
                     "confidence": 0.80,
                     "explainability": ["circular shape", "high circularity", "impact pattern"],
@@ -469,7 +509,7 @@ def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, An
                     "region": region_label,
                     "bbox": bbox,
                     "type": "dent",
-                    "description": f"Major structural damage detected - significant area affected ({area/img_area*100:.1f}% of image).",
+                    "description": f"Major structural damage detected on {region_label} - significant area affected ({area/img_area*100:.1f}% of image).",
                     "severity": "HIGH",
                     "confidence": 0.85,
                     "explainability": ["large affected area", "structural change", f"coverage: {area/img_area*100:.1f}%"],
@@ -483,7 +523,7 @@ def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, An
                     "region": region_label,
                     "bbox": bbox,
                     "type": "dent",
-                    "description": f"Localized damage detected in {region_label} (area: {area/img_area*100:.1f}% of image).",
+                    "description": f"Localized damage detected on {region_label} (area: {area/img_area*100:.1f}% of image).",
                     "severity": "MEDIUM" if area / img_area < 0.03 else "HIGH",
                     "confidence": 0.70,
                     "explainability": ["localized change", "intensity difference", f"area: {area/img_area*100:.1f}%"],

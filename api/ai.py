@@ -27,15 +27,21 @@ def _configure_genai():
 
 FEW_SHOT = (
     "Return STRICT JSON as {\"differences\":[...]}. Example:\n"
-    "{\n  \"differences\": [\n    {\n      \"id\": \"d1\", \"region\": \"top seam\", \"bbox\": [0.12,0.03,0.76,0.08], \"type\": \"seal_tamper\",\n"
+    "{\n  \"differences\": [\n    {\n      \"id\": \"d1\", \"region\": \"top edge\", \"bbox\": [0.12,0.03,0.76,0.08], \"type\": \"seal_tamper\",\n"
     "      \"description\": \"Seal gap visible with lifted flap indicating potential tampering.\", \"severity\": \"HIGH\", \"confidence\": 0.84,\n"
-    "      \"explainability\": [\"gap at seam\", \"edge discontinuity\", \"lifted flap\"], \"suggested_action\": \"Immediate quarantine\", \"tis_delta\": -35\n"
+    "      \"explainability\": [\"gap at seam\", \"edge discontinuity\", \"lifted flap\"], \"suggested_action\": \"Immediate quarantine\", \"tis_delta\": -40\n"
     "    },\n    {\n      \"id\": \"d2\", \"region\": \"left side\", \"bbox\": [0.06,0.42,0.18,0.12], \"type\": \"dent\",\n"
-    "      \"description\": \"Concave deformation on side panel suggesting impact damage.\", \"severity\": \"MEDIUM\", \"confidence\": 0.78,\n"
+    "      \"description\": \"Concave deformation on left side panel suggesting impact damage.\", \"severity\": \"MEDIUM\", \"confidence\": 0.78,\n"
     "      \"explainability\": [\"shading collapse\", \"curvature change\", \"impact pattern\"], \"suggested_action\": \"Supervisor review\", \"tis_delta\": -15\n"
-    "    },\n    {\n      \"id\": \"d3\", \"region\": \"label area\", \"bbox\": [0.2,0.1,0.6,0.2], \"type\": \"label_mismatch\",\n"
+    "    },\n    {\n      \"id\": \"d3\", \"region\": \"right side\", \"bbox\": [0.75,0.35,0.15,0.25], \"type\": \"scratch\",\n"
+    "      \"description\": \"Linear scratch mark on right side panel.\", \"severity\": \"LOW\", \"confidence\": 0.72,\n"
+    "      \"explainability\": [\"linear mark\", \"surface abrasion\", \"edge contrast\"], \"suggested_action\": \"Proceed\", \"tis_delta\": -8\n"
+    "    },\n    {\n      \"id\": \"d4\", \"region\": \"front panel\", \"bbox\": [0.2,0.1,0.6,0.2], \"type\": \"label_mismatch\",\n"
     "      \"description\": \"Label appears altered or replaced with different product information.\", \"severity\": \"HIGH\", \"confidence\": 0.82,\n"
     "      \"explainability\": [\"text mismatch\", \"font difference\", \"color variation\"], \"suggested_action\": \"Quarantine batch\", \"tis_delta\": -40\n"
+    "    },\n    {\n      \"id\": \"d5\", \"region\": \"top-left corner\", \"bbox\": [0.0,0.0,0.15,0.15], \"type\": \"dent\",\n"
+    "      \"description\": \"Corner damage detected in top-left area.\", \"severity\": \"MEDIUM\", \"confidence\": 0.75,\n"
+    "      \"explainability\": [\"corner deformation\", \"impact damage\", \"structural change\"], \"suggested_action\": \"Supervisor review\", \"tis_delta\": -15\n"
     "    }\n  ]\n}"
 )
 
@@ -107,6 +113,16 @@ def call_gemini_ensemble(baseline: Tuple[Optional[bytes], Optional[str]], curren
         "- stain: Discoloration or contamination\n"
         "- color_shift: Significant color changes indicating tampering\n"
         "- missing_item: Absent components or contents\n"
+        "\nREGION SPECIFICATION:\n"
+        "Be VERY specific about damage locations:\n"
+        "- 'left side': Left edge/panel of the package\n"
+        "- 'right side': Right edge/panel of the package\n"
+        "- 'top edge': Upper portion/seal area\n"
+        "- 'bottom edge': Lower portion/base\n"
+        "- 'front panel': Main visible surface\n"
+        "- 'back panel': Rear surface\n"
+        "- 'corner': Specific corner (top-left, top-right, etc.)\n"
+        "- 'center': Middle area of package\n"
         "\nANALYSIS RULES:\n"
         "1. Return STRICT JSON: {\"differences\":[...]} with NO additional text\n"
         "2. Focus on security-critical issues first (seal_tamper, repackaging, digital_edit)\n"
@@ -114,7 +130,8 @@ def call_gemini_ensemble(baseline: Tuple[Optional[bytes], Optional[str]], curren
         "4. Use HIGH severity for security breaches, MEDIUM for damage, LOW for minor issues\n"
         "5. Confidence should reflect certainty: >0.8 for clear evidence, 0.6-0.8 for likely, <0.6 for uncertain\n"
         "6. Explainability must list specific visual evidence\n"
-        "7. TIS delta: seal_tamper(-35), repackaging(-30), digital_edit(-50), label_mismatch(-40), dent(-15), scratch(-8), others(-5)\n"
+        "7. TIS delta: seal_tamper(-40), repackaging(-35), digital_edit(-50), label_mismatch(-40), dent(-15), scratch(-8), others(-5)\n"
+        "8. ALWAYS specify exact region (left side, right side, top edge, etc.) - never use generic terms\n"
         "\n" + FEW_SHOT
     )
 
