@@ -7,3 +7,13 @@ flask-cors==5.0.0
 jsonschema==4.23.0
 opencv-python-headless==4.10.0.84
 numpy==2.1.2
+torch
+torchvision
+opencv-python
+scikit-image
+pillow
+pandas
+tqdm
+fastapi
+uvicorn[standard]
+scikit-learn
