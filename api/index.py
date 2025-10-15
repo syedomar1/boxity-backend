@@ -5,6 +5,7 @@ import traceback
 import json
 import io
 import base64
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify
 
@@ -163,19 +164,69 @@ def _clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, value))
 
 
-def _compute_overall(differences: List[Dict[str, Any]]) -> Tuple[int, str]:
+def _compute_overall(differences: List[Dict[str, Any]]) -> Tuple[int, str, float, str]:
+    """Enhanced TIS calculation with confidence scoring and detailed assessment.
+    
+    Returns: (tis_score, assessment, confidence, notes)
+    """
+    if not differences:
+        return 100, "SAFE", 0.95, "No differences detected - product integrity maintained"
+    
+    # Start with perfect score
     tis = 100
+    total_confidence = 0.0
+    severity_weights = {"HIGH": 1.0, "MEDIUM": 0.6, "LOW": 0.3}
+    critical_issues = []
+    
     for d in differences:
         try:
+            # Apply TIS delta
             tis += int(d.get("tis_delta", 0))
+            
+            # Weight confidence by severity
+            severity = str(d.get("severity", "LOW")).upper()
+            weight = severity_weights.get(severity, 0.3)
+            confidence = float(d.get("confidence", 0.5))
+            total_confidence += confidence * weight
+            
+            # Track critical issues
+            if severity == "HIGH" and confidence > 0.7:
+                issue_type = str(d.get("type", "unknown"))
+                if issue_type in ["seal_tamper", "repackaging", "digital_edit"]:
+                    critical_issues.append(issue_type)
+                    
         except Exception:
             continue
+    
+    # Calculate weighted confidence
+    avg_confidence = total_confidence / max(1, len(differences)) if differences else 0.0
+    
+    # Clamp TIS score
     tis = _clamp(tis, 0, 100)
-    if tis >= 85:
-        return tis, "OK"
-    if tis >= 70:
-        return tis, "REVIEW_REQUIRED"
-    return tis, "QUARANTINE"
+    
+    # Enhanced assessment logic
+    if tis >= 80:
+        assessment = "SAFE"
+        notes = "Product integrity maintained - safe to proceed"
+    elif tis >= 40:
+        assessment = "MODERATE_RISK"
+        notes = "Moderate risk detected - supervisor review recommended"
+    else:
+        assessment = "HIGH_RISK"
+        notes = "High risk detected - immediate quarantine required"
+    
+    # Override for critical issues
+    if critical_issues:
+        if "seal_tamper" in critical_issues or "repackaging" in critical_issues:
+            tis = min(tis, 25)  # Force high risk for tampering
+            assessment = "HIGH_RISK"
+            notes = f"Critical security breach detected: {', '.join(critical_issues)} - immediate quarantine required"
+        elif "digital_edit" in critical_issues:
+            tis = min(tis, 15)  # Force highest risk for digital tampering
+            assessment = "HIGH_RISK"
+            notes = "Digital tampering detected - highest security risk"
+    
+    return tis, assessment, avg_confidence, notes
 
 
 def _call_gemini(baseline: Tuple[Optional[bytes], Optional[str]], current: Tuple[Optional[bytes], Optional[str]]) -> List[Dict[str, Any]]:
@@ -218,7 +269,7 @@ def _detect_qr_presence(img: "cv2.Mat") -> bool:
 
 
 def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, Any]]:
-    """OpenCV-based regional difference detection with simple heuristics."""
+    """Enhanced OpenCV-based regional difference detection with advanced heuristics."""
     if cv2 is None or Image is None:
         return []
     try:
@@ -231,26 +282,59 @@ def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, An
         h1, w1 = b.shape[:2]
         c_resized = cv2.resize(c, (w1, h1), interpolation=cv2.INTER_AREA)
 
-        # Similarity to detect completely different objects
+        # Enhanced similarity analysis
         sim = _orb_similarity(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), cv2.cvtColor(c_resized, cv2.COLOR_BGR2GRAY))
-
-        # Difference image and threshold
+        
+        # Multi-scale difference detection
         gray_b = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
         gray_c = cv2.cvtColor(c_resized, cv2.COLOR_BGR2GRAY)
-        blur_b = cv2.GaussianBlur(gray_b, (5, 5), 0)
-        blur_c = cv2.GaussianBlur(gray_c, (5, 5), 0)
-        diff = cv2.absdiff(blur_b, blur_c)
-        _, th = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-        th = cv2.dilate(th, np.ones((3, 3), np.uint8), iterations=1)
+        
+        # Apply multiple blur levels for different detail levels
+        blur_levels = [(3, 3), (5, 5), (7, 7)]
+        all_diffs = []
+        
+        for blur_size in blur_levels:
+            blur_b = cv2.GaussianBlur(gray_b, blur_size, 0)
+            blur_c = cv2.GaussianBlur(gray_c, blur_size, 0)
+            diff = cv2.absdiff(blur_b, blur_c)
+            all_diffs.append(diff)
+        
+        # Combine differences from multiple scales
+        combined_diff = np.maximum.reduce(all_diffs)
+        
+        # Enhanced thresholding with adaptive methods
+        _, th_otsu = cv2.threshold(combined_diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, th_adaptive = cv2.threshold(combined_diff, 30, 255, cv2.THRESH_BINARY)
+        
+        # Combine both thresholding methods
+        th = cv2.bitwise_or(th_otsu, th_adaptive)
+        
+        # Enhanced morphological operations
+        kernel_small = np.ones((2, 2), np.uint8)
+        kernel_medium = np.ones((3, 3), np.uint8)
+        
+        # Remove noise
+        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel_small, iterations=1)
+        # Fill gaps
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel_medium, iterations=1)
+        # Dilate to connect nearby regions
+        th = cv2.dilate(th, kernel_medium, iterations=1)
 
-        # Contours
-        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Enhanced contour detection
+        contours, hierarchy = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         regions: List[Dict[str, Any]] = []
         img_area = float(w1 * h1)
-        top_band = int(0.25 * h1)  # top 25% region for seal detection
+        
+        # Define regions of interest
+        top_band = int(0.25 * h1)  # top 25% for seal detection
+        center_region = (int(0.2 * w1), int(0.2 * h1), int(0.6 * w1), int(0.6 * h1))  # center 60% for main content
+        
+        # Calculate image quality metrics
+        baseline_sharpness = cv2.Laplacian(gray_b, cv2.CV_64F).var()
+        current_sharpness = cv2.Laplacian(gray_c, cv2.CV_64F).var()
+        sharpness_ratio = current_sharpness / max(baseline_sharpness, 1.0)
 
-        # QR presence change
+        # Enhanced QR and barcode detection
         qr_base = _detect_qr_presence(b)
         qr_curr = _detect_qr_presence(c_resized)
         if qr_base != qr_curr:
@@ -259,80 +343,152 @@ def _classical_diff_regions(b_bytes: bytes, c_bytes: bytes) -> List[Dict[str, An
                 "region": "label area",
                 "bbox": None,
                 "type": "label_mismatch",
-                "description": "QR code presence differs between baseline and current image.",
-                "severity": "MEDIUM",
-                "confidence": 0.8,
-                "explainability": ["QR detected mismatch"],
-                "suggested_action": "Supervisor review",
-                "tis_delta": -22,
+                "description": "QR code presence differs between baseline and current image - potential label tampering.",
+                "severity": "HIGH",
+                "confidence": 0.85,
+                "explainability": ["QR code mismatch", "label area change"],
+                "suggested_action": "Immediate quarantine",
+                "tis_delta": -35,
+            }))
+        
+        # Detect significant image quality degradation (potential digital tampering)
+        if sharpness_ratio < 0.5 or sharpness_ratio > 2.0:
+            regions.append(_normalize_diff_item({
+                "id": "quality-degradation",
+                "region": "overall",
+                "bbox": None,
+                "type": "digital_edit",
+                "description": f"Significant image quality change detected (sharpness ratio: {sharpness_ratio:.2f}) - potential digital manipulation.",
+                "severity": "HIGH",
+                "confidence": 0.75,
+                "explainability": [f"sharpness change: {sharpness_ratio:.2f}", "image quality degradation"],
+                "suggested_action": "Quarantine for digital forensics",
+                "tis_delta": -45,
             }))
 
-        # Repackaging / different object if similarity is very low
+        # Enhanced repackaging detection
         if sim < 0.15:
             regions.append(_normalize_diff_item({
                 "id": "repackaging-1",
                 "region": "overall",
                 "bbox": None,
                 "type": "repackaging",
-                "description": "Current image appears to be a different object or repackaged item compared to baseline.",
+                "description": "Current image appears to be a completely different object or heavily repackaged item compared to baseline.",
                 "severity": "HIGH",
-                "confidence": 0.85,
-                "explainability": [f"low ORB similarity: {sim:.2f}"],
-                "suggested_action": "Quarantine batch",
-                "tis_delta": -35,
+                "confidence": 0.90,
+                "explainability": [f"extremely low ORB similarity: {sim:.2f}", "structural mismatch"],
+                "suggested_action": "Immediate quarantine - potential product substitution",
+                "tis_delta": -50,
+            }))
+        elif sim < 0.4:
+            regions.append(_normalize_diff_item({
+                "id": "moderate-repackaging",
+                "region": "overall",
+                "bbox": None,
+                "type": "repackaging",
+                "description": "Significant structural changes detected - possible repackaging or major damage.",
+                "severity": "MEDIUM",
+                "confidence": 0.75,
+                "explainability": [f"low ORB similarity: {sim:.2f}", "structural changes"],
+                "suggested_action": "Supervisor review required",
+                "tis_delta": -25,
             }))
 
+        # Enhanced contour analysis with better heuristics
         for i, cnt in enumerate(contours):
             x, y, w, h = cv2.boundingRect(cnt)
             area = float(w * h)
-            if area / img_area < 0.005:  # ignore tiny specks <0.5%
+            if area / img_area < 0.003:  # ignore tiny specks <0.3%
                 continue
-            # Heuristics
+                
+            # Enhanced geometric analysis
             aspect = max(w, h) / max(1.0, min(w, h))
+            perimeter = cv2.arcLength(cnt, True)
+            circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+            
+            # Region classification
             near_top = y < top_band
-            long_thin = aspect > 6.0 and area / img_area < 0.05
-            region_label = "top region" if near_top else (
-                "left side" if x < w1 * 0.33 else ("right side" if x + w > w1 * 0.66 else "center"))
+            in_center = (center_region[0] <= x <= center_region[2] and 
+                        center_region[1] <= y <= center_region[3])
+            near_edge = (x < w1 * 0.1 or x + w > w1 * 0.9 or 
+                        y < h1 * 0.1 or y + h > h1 * 0.9)
+            
+            region_label = ("top seal area" if near_top else 
+                          "center region" if in_center else 
+                          "edge region" if near_edge else "side region")
+            
             bbox = [x / w1, y / h1, w / w1, h / h1]
-
-            if near_top and h > 0.08 * h1 and w > 0.25 * w1:
+            
+            # Enhanced damage type classification
+            if near_top and h > 0.06 * h1 and w > 0.2 * w1:
+                # Seal tampering detection
                 diff_item = {
-                    "id": f"seal-{i}",
-                    "region": "center seal" if x + w/2 > w1*0.33 and x + w/2 < w1*0.66 else "top edge",
+                    "id": f"seal-tamper-{i}",
+                    "region": "seal area",
                     "bbox": bbox,
                     "type": "seal_tamper",
-                    "description": "Seal area shows opening/gap inconsistent with baseline.",
+                    "description": f"Seal area shows significant change - potential tampering detected (area: {area/img_area*100:.1f}% of image).",
                     "severity": "HIGH",
-                    "confidence": 0.78,
-                    "explainability": ["large change along top seam", "thresholded contour"],
-                    "suggested_action": "Supervisor review",
-                    "tis_delta": -32,
+                    "confidence": 0.85,
+                    "explainability": ["large change in seal area", "top region modification", f"area coverage: {area/img_area*100:.1f}%"],
+                    "suggested_action": "Immediate quarantine - security breach",
+                    "tis_delta": -40,
                 }
-            elif long_thin:
+            elif aspect > 8.0 and area / img_area < 0.03:
+                # Scratch detection
                 diff_item = {
                     "id": f"scratch-{i}",
                     "region": region_label,
                     "bbox": bbox,
                     "type": "scratch",
-                    "description": "Linear high-contrast mark consistent with scratch.",
+                    "description": f"Linear mark detected - consistent with scratch or cut (length: {max(w,h):.0f}px).",
                     "severity": "LOW",
-                    "confidence": 0.7,
-                    "explainability": ["long thin contour", "edge contrast"],
-                    "suggested_action": "Proceed",
-                    "tis_delta": -4,
+                    "confidence": 0.75,
+                    "explainability": ["high aspect ratio", "linear pattern", "edge contrast"],
+                    "suggested_action": "Proceed with caution",
+                    "tis_delta": -8,
                 }
-            else:
+            elif circularity > 0.6 and area / img_area > 0.02:
+                # Circular damage (dents, holes)
                 diff_item = {
-                    "id": f"dent-{i}",
+                    "id": f"circular-damage-{i}",
                     "region": region_label,
                     "bbox": bbox,
                     "type": "dent",
-                    "description": "Localized deformation/region change likely indicating a dent or indentation.",
-                    "severity": "MEDIUM" if area / img_area < 0.08 else "HIGH",
-                    "confidence": 0.72,
-                    "explainability": ["blob-like contour", "local intensity change"],
-                    "suggested_action": "Supervisor review" if area / img_area >= 0.08 else "Proceed",
-                    "tis_delta": -12 if area / img_area < 0.08 else -18,
+                    "description": f"Circular deformation detected - likely impact damage (diameter: {max(w,h):.0f}px).",
+                    "severity": "MEDIUM" if area / img_area < 0.05 else "HIGH",
+                    "confidence": 0.80,
+                    "explainability": ["circular shape", "high circularity", "impact pattern"],
+                    "suggested_action": "Supervisor review" if area / img_area >= 0.05 else "Proceed",
+                    "tis_delta": -15 if area / img_area < 0.05 else -25,
+                }
+            elif area / img_area > 0.08:
+                # Large damage area
+                diff_item = {
+                    "id": f"major-damage-{i}",
+                    "region": region_label,
+                    "bbox": bbox,
+                    "type": "dent",
+                    "description": f"Major structural damage detected - significant area affected ({area/img_area*100:.1f}% of image).",
+                    "severity": "HIGH",
+                    "confidence": 0.85,
+                    "explainability": ["large affected area", "structural change", f"coverage: {area/img_area*100:.1f}%"],
+                    "suggested_action": "Immediate quarantine - major damage",
+                    "tis_delta": -30,
+                }
+            else:
+                # General damage
+                diff_item = {
+                    "id": f"damage-{i}",
+                    "region": region_label,
+                    "bbox": bbox,
+                    "type": "dent",
+                    "description": f"Localized damage detected in {region_label} (area: {area/img_area*100:.1f}% of image).",
+                    "severity": "MEDIUM" if area / img_area < 0.03 else "HIGH",
+                    "confidence": 0.70,
+                    "explainability": ["localized change", "intensity difference", f"area: {area/img_area*100:.1f}%"],
+                    "suggested_action": "Supervisor review" if area / img_area >= 0.03 else "Proceed",
+                    "tis_delta": -12 if area / img_area < 0.03 else -20,
                 }
             regions.append(_normalize_diff_item(diff_item))
 
@@ -390,8 +546,7 @@ def analyze():
                 else:
                     differences = cv_regions
 
-        tis, assessment = _compute_overall(differences)
-        conf_overall = 0.9 if differences else 0.7
+        tis, assessment, conf_overall, notes = _compute_overall(differences)
 
         response = {
             "differences": differences,
@@ -400,7 +555,14 @@ def analyze():
             "aggregate_tis": tis,
             "overall_assessment": assessment,
             "confidence_overall": conf_overall,
-            "notes": "OK" if not differences else "Potential issues detected"
+            "notes": notes,
+            "analysis_metadata": {
+                "total_differences": len(differences),
+                "high_severity_count": len([d for d in differences if str(d.get("severity", "")).upper() == "HIGH"]),
+                "medium_severity_count": len([d for d in differences if str(d.get("severity", "")).upper() == "MEDIUM"]),
+                "low_severity_count": len([d for d in differences if str(d.get("severity", "")).upper() == "LOW"]),
+                "analysis_timestamp": str(datetime.now().isoformat()) if 'datetime' in globals() else "unknown"
+            }
         }
         return jsonify(response)
     except Exception as e:

@@ -28,11 +28,14 @@ def _configure_genai():
 FEW_SHOT = (
     "Return STRICT JSON as {\"differences\":[...]}. Example:\n"
     "{\n  \"differences\": [\n    {\n      \"id\": \"d1\", \"region\": \"top seam\", \"bbox\": [0.12,0.03,0.76,0.08], \"type\": \"seal_tamper\",\n"
-    "      \"description\": \"Seal gap visible with lifted flap.\", \"severity\": \"HIGH\", \"confidence\": 0.84,\n"
-    "      \"explainability\": [\"gap at seam\", \"edge discontinuity\"], \"suggested_action\": \"Supervisor review\", \"tis_delta\": -32\n"
+    "      \"description\": \"Seal gap visible with lifted flap indicating potential tampering.\", \"severity\": \"HIGH\", \"confidence\": 0.84,\n"
+    "      \"explainability\": [\"gap at seam\", \"edge discontinuity\", \"lifted flap\"], \"suggested_action\": \"Immediate quarantine\", \"tis_delta\": -35\n"
     "    },\n    {\n      \"id\": \"d2\", \"region\": \"left side\", \"bbox\": [0.06,0.42,0.18,0.12], \"type\": \"dent\",\n"
-    "      \"description\": \"Concave deformation on side panel.\", \"severity\": \"MEDIUM\", \"confidence\": 0.78,\n"
-    "      \"explainability\": [\"shading collapse\", \"curvature change\"], \"suggested_action\": \"Supervisor review\", \"tis_delta\": -12\n"
+    "      \"description\": \"Concave deformation on side panel suggesting impact damage.\", \"severity\": \"MEDIUM\", \"confidence\": 0.78,\n"
+    "      \"explainability\": [\"shading collapse\", \"curvature change\", \"impact pattern\"], \"suggested_action\": \"Supervisor review\", \"tis_delta\": -15\n"
+    "    },\n    {\n      \"id\": \"d3\", \"region\": \"label area\", \"bbox\": [0.2,0.1,0.6,0.2], \"type\": \"label_mismatch\",\n"
+    "      \"description\": \"Label appears altered or replaced with different product information.\", \"severity\": \"HIGH\", \"confidence\": 0.82,\n"
+    "      \"explainability\": [\"text mismatch\", \"font difference\", \"color variation\"], \"suggested_action\": \"Quarantine batch\", \"tis_delta\": -40\n"
     "    }\n  ]\n}"
 )
 
@@ -51,7 +54,7 @@ def _extract_json(text: str) -> Dict[str, Any]:
     text = (text or "").strip()
     if not text:
         return {"differences": []}
-    if text.startswith("```)":
+    if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text)
     if not text.lstrip().startswith('{'):
         match = re.search(r"\{[\s\S]*\}", text)
@@ -92,19 +95,35 @@ def call_gemini_ensemble(baseline: Tuple[Optional[bytes], Optional[str]], curren
         return []
 
     system = (
-        "You are a multimodal forensic/computer-vision assistant specialized in package integrity analysis.\n"
-        "Task: Compare baseline vs current package photos and detect concrete issues (dent, scratch, seal_tamper, label_mismatch, repackaging, stain, color_shift, missing_item, digital_edit).\n"
-        "Rules:\n- Return STRICT JSON: {\"differences\":[...]} with NO prose.\n- Prefer multiple localized regions with realistic bboxes.\n- If confidence is high and changes are localized, avoid a single \"overall\" item.\n"
-        "- Only report digital_edit if you see artifacts; list indicators in explainability.\n"
-        + FEW_SHOT
+        "You are an expert multimodal forensic analyst specializing in package integrity and tampering detection.\n"
+        "\nMISSION: Compare baseline vs current package photos to detect security breaches and integrity violations.\n"
+        "\nDETECTION TARGETS:\n"
+        "- seal_tamper: Broken, lifted, or altered seals (CRITICAL SECURITY RISK)\n"
+        "- repackaging: Different packaging, missing elements, or structural changes\n"
+        "- label_mismatch: Altered, replaced, or counterfeit labels\n"
+        "- digital_edit: Photo manipulation, cloning, or artificial modifications\n"
+        "- dent: Physical damage from impact or compression\n"
+        "- scratch: Surface abrasions or cuts\n"
+        "- stain: Discoloration or contamination\n"
+        "- color_shift: Significant color changes indicating tampering\n"
+        "- missing_item: Absent components or contents\n"
+        "\nANALYSIS RULES:\n"
+        "1. Return STRICT JSON: {\"differences\":[...]} with NO additional text\n"
+        "2. Focus on security-critical issues first (seal_tamper, repackaging, digital_edit)\n"
+        "3. Provide precise bbox coordinates [x,y,w,h] in 0..1 range\n"
+        "4. Use HIGH severity for security breaches, MEDIUM for damage, LOW for minor issues\n"
+        "5. Confidence should reflect certainty: >0.8 for clear evidence, 0.6-0.8 for likely, <0.6 for uncertain\n"
+        "6. Explainability must list specific visual evidence\n"
+        "7. TIS delta: seal_tamper(-35), repackaging(-30), digital_edit(-50), label_mismatch(-40), dent(-15), scratch(-8), others(-5)\n"
+        "\n" + FEW_SHOT
     )
 
     parts = [
         system,
-        "Weighting/TIS guidance: dent (-8..-18), scratch (-3..-7), seal_tamper (-25..-45), label_mismatch (-20..-40), digital_edit (-30..-60), missing_item (-100).",
-        "Ensure bbox is [x,y,w,h] in 0..1, or null when unsure.",
-        "Baseline:", {"mime_type": baseline_mime or "image/jpeg", "data": baseline_bytes},
-        "Current:", {"mime_type": current_mime or "image/jpeg", "data": current_bytes},
+        "\nCRITICAL: Focus on security threats. A single seal_tamper or digital_edit should trigger immediate quarantine.\n"
+        "Be conservative with confidence scores - only use >0.8 when evidence is unequivocal.\n"
+        "\nBaseline Image (Reference):", {"mime_type": baseline_mime or "image/jpeg", "data": baseline_bytes},
+        "\nCurrent Image (Under Analysis):", {"mime_type": current_mime or "image/jpeg", "data": current_bytes},
     ]
 
     model_pro = _build_model("gemini-1.5-pro-latest")

@@ -23,15 +23,35 @@ DIFFERENCE_ITEM_SCHEMA: Dict[str, Any] = {
     "additionalProperties": True,
 }
 
+ANALYSIS_METADATA_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "total_differences": {"type": "integer", "minimum": 0},
+        "high_severity_count": {"type": "integer", "minimum": 0},
+        "medium_severity_count": {"type": "integer", "minimum": 0},
+        "low_severity_count": {"type": "integer", "minimum": 0},
+        "analysis_timestamp": {"type": "string"}
+    },
+    "required": ["total_differences", "high_severity_count", "medium_severity_count", "low_severity_count", "analysis_timestamp"],
+    "additionalProperties": True,
+}
+
 RESPONSE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "differences": {
             "type": "array",
             "items": DIFFERENCE_ITEM_SCHEMA
-        }
+        },
+        "aggregate_tis": {"type": "integer", "minimum": 0, "maximum": 100},
+        "overall_assessment": {"type": "string", "enum": ["SAFE", "MODERATE_RISK", "HIGH_RISK"]},
+        "confidence_overall": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "notes": {"type": "string"},
+        "baseline_image_info": {"type": "object"},
+        "current_image_info": {"type": "object"},
+        "analysis_metadata": ANALYSIS_METADATA_SCHEMA
     },
-    "required": ["differences"],
+    "required": ["differences", "aggregate_tis", "overall_assessment", "confidence_overall", "notes"],
     "additionalProperties": True,
 }
 
